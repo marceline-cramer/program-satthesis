@@ -1,13 +1,7 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-use z3::{
-    ast::{Ast, Bool},
-    Config, Context, SatResult, Solver,
-};
+use im::{HashMap, HashSet};
+use z3::{ast::Bool, Config, Context, SatResult, Solver};
 
 pub fn read_dimacs(path: impl AsRef<Path>) -> Vec<Clause> {
     let src = std::fs::read_to_string(path).expect("failed to read DIMACS file");
@@ -72,9 +66,9 @@ pub fn infer_variables(clauses: Vec<Clause>) -> BTreeMap<Variable, VariableInfer
             let var: &mut VariableInference = var_map.entry(lit.var).or_default();
 
             if lit.pol {
-                var.positive.push(body);
+                var.positive.insert(body);
             } else {
-                var.negative.push(body);
+                var.negative.insert(body);
             }
         }
     }
@@ -82,10 +76,12 @@ pub fn infer_variables(clauses: Vec<Clause>) -> BTreeMap<Variable, VariableInfer
     var_map
 }
 
-#[derive(Debug, Default)]
+pub type InferenceMap = BTreeMap<Variable, VariableInference>;
+
+#[derive(Clone, Debug, Default)]
 pub struct VariableInference {
-    pub positive: Vec<HornBody>,
-    pub negative: Vec<HornBody>,
+    pub positive: HashSet<HornBody>,
+    pub negative: HashSet<HornBody>,
 }
 
 impl VariableInference {
@@ -101,27 +97,30 @@ impl VariableInference {
         !self.positive.is_empty()
     }
 
-    pub fn only_assigned(&self, assigned: &HashSet<Variable>) -> Self {
-        Self {
-            positive: self
-                .positive
-                .iter()
-                .filter(|body| body.vars.is_subset(assigned))
-                .cloned()
-                .collect(),
-            negative: self
-                .negative
-                .iter()
-                .filter(|body| body.vars.is_subset(assigned))
-                .cloned()
-                .collect(),
-        }
+    pub fn take_fully_assigned(&mut self, dst: &mut Self, assigned: &HashSet<Variable>) {
+        self.positive.retain(|body| {
+            if body.vars.is_subset(assigned) {
+                dst.positive.insert(body.clone());
+                false
+            } else {
+                true
+            }
+        });
+
+        self.negative.retain(|body| {
+            if body.vars.is_subset(assigned) {
+                dst.negative.insert(body.clone());
+                false
+            } else {
+                true
+            }
+        });
     }
 
     pub fn polarity_ast<'ctx>(
         &self,
         ctx: &'ctx Context,
-        values: &BTreeMap<Variable, Bool<'ctx>>,
+        values: &HashMap<Variable, Bool<'ctx>>,
         pol: bool,
     ) -> Bool<'ctx> {
         let bodies = if pol { &self.positive } else { &self.negative };
@@ -150,21 +149,9 @@ impl VariableInference {
         let clauses: Vec<_> = clauses.iter().collect();
         Bool::or(ctx, &clauses)
     }
-
-    pub fn print(&self, var: Variable) {
-        println!("{var} positive:");
-        for body in self.positive.iter() {
-            println!("\t{}", format_clause(&body.clause));
-        }
-
-        println!("{var} negative:");
-        for body in self.negative.iter() {
-            println!("\t{}", format_clause(&body.clause));
-        }
-    }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HornBody {
     pub clause: Clause,
     pub vars: HashSet<Variable>,
@@ -208,125 +195,208 @@ pub struct SearchNode<'ctx> {
     pub ctx: &'ctx Context,
     pub solver: &'ctx Solver<'ctx>,
     pub assigned: HashSet<Variable>,
-    pub values: BTreeMap<Variable, Bool<'ctx>>,
-    pub remaining_vars: Vec<Variable>,
-    pub remaining_idx: usize,
-    pub variable_inference: Arc<BTreeMap<Variable, VariableInference>>,
+    pub values: HashMap<Variable, Bool<'ctx>>,
+    pub children: Vec<Variable>,
+    pub inference: InferenceMap,
+    pub inferred: InferenceMap,
     pub log: String,
     pub nondet_num: usize,
 }
 
 impl<'ctx> SearchNode<'ctx> {
-    pub fn new(
-        ctx: &'ctx Context,
-        solver: &'ctx Solver<'ctx>,
-        variable_inference: BTreeMap<Variable, VariableInference>,
-    ) -> Self {
-        Self {
+    pub fn new(ctx: &'ctx Context, solver: &'ctx Solver<'ctx>, vars: InferenceMap) -> Self {
+        let mut root = Self {
             ctx,
             solver,
-            assigned: HashSet::new(),
-            values: BTreeMap::new(),
-            remaining_vars: variable_inference.keys().copied().collect(),
-            remaining_idx: 0,
-            variable_inference: Arc::new(variable_inference),
+            assigned: HashSet::default(),
+            values: HashMap::default(),
+            children: vec![],
+            inference: vars.clone(),
+            inferred: InferenceMap::default(),
             log: String::new(),
             nondet_num: 0,
-        }
+        };
+
+        root.populate_children();
+
+        root
     }
 
-    pub fn prioritize_remaining(&mut self) {
-        self.remaining_vars.sort_by_cached_key(|var| {
-            let infer = self
-                .variable_inference
-                .get(var)
-                .unwrap()
-                .only_assigned(&self.assigned);
+    /// Populates the children field with a prioritized list of variables.
+    pub fn populate_children(&mut self) {
+        // find the list of unassigned variables
+        self.children = self.unassigned().into_iter().collect();
 
-            let product = (infer.positive.len() * infer.negative.len()) as isize;
-            let sum = (infer.positive.len() + infer.negative.len()) as isize;
-            (-product, sum)
+        // sort them by their priority
+        self.children.sort_by_cached_key(|var| {
+            let infer = self.inference.get(var).cloned().unwrap_or_default();
+            let product1 = (infer.positive.len() * infer.negative.len()) as isize;
+            let inferred = self.inferred.get(var).cloned().unwrap_or_default();
+            let product2 = ((inferred.positive.len() + 1) * (inferred.negative.len() + 1)) as isize;
+            (-product1, product2)
         });
     }
 
+    /// Converts a clause into a Z3 AST using assigned variables.
+    pub fn clause_to_ast(&self, clause: &Clause) -> Bool<'ctx> {
+        let clause: Vec<_> = clause
+            .iter()
+            .map(|lit| {
+                let value = self.values.get(&lit.var).unwrap();
+                if lit.pol {
+                    value.clone()
+                } else {
+                    value.not()
+                }
+            })
+            .collect();
+
+        let clause: Vec<_> = clause.iter().collect();
+        Bool::and(self.ctx, &clause)
+    }
+
+    /// Adds assertions to guarantee that clauses are not violated by assigned variables.
+    ///
+    /// As a side-effect, immediately assigns variables who have no remaining clauses.
+    pub fn infer_clauses(&mut self) {
+        // iteratively propagate all clause inferences
+        loop {
+            // keep track of new variables that should be immediately assigned
+            let mut immediately_assign = Vec::new();
+
+            // find all of the new variable inferences from the currently assigned variables
+            for (var, infer) in self.inference.iter_mut() {
+                let dst = self.inferred.entry(*var).or_default();
+                infer.take_fully_assigned(dst, &self.assigned);
+
+                // if a variable's inference has been depleted, assign it ASAP
+                if infer.is_empty() && !self.assigned.contains(var) {
+                    immediately_assign.push(*var);
+                }
+            }
+
+            // if no variables need to be immediately assigned, break the loop
+            if immediately_assign.is_empty() {
+                break;
+            }
+
+            // assign all of the following variables
+            for var in immediately_assign {
+                self.log.push_str(&format!("immediately assigning {var}\n"));
+                self.assign(var);
+            }
+        }
+    }
+
+    /// Find the set of variables that have not been assigned yet.
+    pub fn unassigned(&self) -> HashSet<Variable> {
+        self.inference
+            .keys()
+            .filter(|var| !self.assigned.contains(var))
+            .copied()
+            .collect()
+    }
+
+    /// Assigns a variable.
+    pub fn assign(&mut self, var: Variable) {
+        // retrieve the active inferences for this variable
+        let infer = self.inferred.remove(&var).unwrap_or_default();
+
+        // create an AST variable to represent this variable
+        let val = Bool::new_const(self.ctx, format!("{var}"));
+
+        // track this variable
+        self.assigned.insert(var);
+        self.values.insert(var, val.clone());
+
+        // constrain the value of the variable based on inference
+        if infer.is_empty() {
+            // there are no clauses constraining this variable, so it is non-deterministic
+            self.nondet_num += 1;
+            self.log.push_str(&format!("{var} = nondet()\n"));
+        } else {
+            // there are clauses constraining the variable, so get their ASTs
+            let positive_def = infer.polarity_ast(self.ctx, &self.values, true);
+            let negative_def = infer.polarity_ast(self.ctx, &self.values, false);
+
+            // find the condition that the variable is constrained to
+            let condition = if !infer.has_negative() {
+                // the variable is unconstrained by negative clauses; use positive
+                positive_def
+            } else if !infer.has_positive() {
+                // the variable is unconstrained by positive clauses; use negative
+                negative_def.not()
+            } else {
+                // find out if the program permits neither polarity's inference
+                let neither = Bool::or(self.ctx, &[&positive_def, &negative_def]).not();
+                let allows_neither = self.solver.check_assumptions(&[neither]) == SatResult::Sat;
+
+                // if it does, we need to add a non-deterministic case to cover all solutions
+                let nondet = if allows_neither {
+                    self.nondet_num += 1;
+                    Bool::new_const(self.ctx, format!("{var}-nondet"))
+                } else {
+                    Bool::from_bool(self.ctx, true)
+                };
+
+                // either positive or negative can be inferred, so acknowledge
+                // inference while allowing for non-determinism
+                let negative = Bool::and(self.ctx, &[&negative_def.not(), &nondet]);
+                Bool::or(self.ctx, &[&positive_def, &negative])
+            };
+
+            // constrain the value of the variable
+            self.log.push_str(&format!("{var} = {condition}\n"));
+            self.solver.assert(&val.iff(&condition));
+        }
+    }
+
+    /// Checks if the current problem is satisfiable.
+    pub fn check_validity(&self) -> bool {
+        self.solver.check() == SatResult::Sat
+    }
+
+    /// Finds one possible child of this search subtree, if there is one.
     pub fn search(&mut self) -> Option<Self> {
-        if self.remaining_vars.is_empty() {
-            println!(
-                "solution found with {} non-deterministic variables:",
-                self.nondet_num
-            );
+        // abort if the search is complete
+        if self.unassigned().is_empty() {
+            println!("solution found:",);
+            println!("{}", self.solver);
             println!("{}", self.log);
+            println!("{} non-deterministic variables.", self.nondet_num);
             assert!(self.solver.check() == SatResult::Sat);
             panic!();
             self.solver.pop(1);
             return None;
         }
 
-        if self.remaining_idx >= self.remaining_vars.len() {
-            return None;
+        // find a valid child
+        while let Some(var) = self.children.pop() {
+            // enter a Z3 scope
+            self.solver.push();
+
+            // set up the child
+            let mut child = self.clone();
+            child.assign(var);
+            child.infer_clauses();
+
+            // verify the child's validity
+            if !child.check_validity() {
+                // if the child is invalid, try another one
+                let depth = self.assigned.len();
+                println!("conflict in {depth:<4} at {var}");
+                self.solver.pop(1);
+                continue;
+            }
+
+            // populate the child's children and return it
+            child.populate_children();
+            return Some(child);
         }
 
-        let mut child = self.clone();
-        let var = child.remaining_vars.remove(self.remaining_idx);
-        self.remaining_idx += 1;
-        child.remaining_idx = 0;
-
-        let infer = self
-            .variable_inference
-            .get(&var)
-            .unwrap()
-            .only_assigned(&self.assigned);
-
-        child.solver.push();
-        let val = Bool::new_const(self.ctx, format!("{var}"));
-        child.values.insert(var, val.clone());
-        if infer.is_empty() {
-            child.nondet_num += 1;
-            child.log.push_str(&format!("{var} = nondet()\n"));
-        } else {
-            let positive_def = infer.polarity_ast(self.ctx, &self.values, true);
-            let negative_def = infer.polarity_ast(self.ctx, &self.values, false);
-
-            let condition = if !infer.has_negative() {
-                positive_def
-            } else if !infer.has_positive() {
-                negative_def.not()
-            } else {
-                let conflict = Bool::and(self.ctx, &[&positive_def, &negative_def]);
-                self.solver.assert(&conflict.not());
-
-                let neither = Bool::or(self.ctx, &[&positive_def, &negative_def]);
-                let nondet = if self.solver.check_assumptions(&[neither.not()]) == SatResult::Sat {
-                    child.nondet_num += 1;
-                    Bool::new_const(self.ctx, format!("{var}-nondet"))
-                } else {
-                    Bool::from_bool(self.ctx, true)
-                };
-
-                if infer.positive.len() > infer.negative.len() {
-                    let positive = Bool::or(self.ctx, &[&positive_def, &nondet]);
-                    Bool::and(self.ctx, &[&negative_def.not(), &positive])
-                } else {
-                    let negative = Bool::and(self.ctx, &[&negative_def.not(), &nondet]);
-                    Bool::or(self.ctx, &[&positive_def, &negative])
-                }
-            };
-
-            let condition = condition.simplify();
-            child.log.push_str(&format!("{var} = {condition}\n"));
-            self.solver.assert(&val.iff(&condition));
-        }
-
-        if self.solver.check() != SatResult::Sat {
-            println!("conflict in {var}:");
-            println!("{}", self.log);
-            self.solver.pop(1);
-            return None;
-        }
-
-        child.assigned.insert(var);
-        child.prioritize_remaining();
-        Some(child)
+        // no child could be found
+        self.solver.pop(1);
+        None
     }
 }
 
@@ -336,17 +406,44 @@ fn main() {
         .expect("expected path to DIMACS file");
 
     let base_clauses = read_dimacs(&path);
-    let inferred = infer_variables(base_clauses);
 
     let cfg = Config::new();
     let ctx = Context::new(&cfg);
     let solver = Solver::new(&ctx);
-    let base = SearchNode::new(&ctx, &solver, inferred);
 
+    for clause in base_clauses.iter() {
+        let terms: Vec<_> = clause
+            .iter()
+            .map(|lit| {
+                let var = Bool::new_const(&ctx, format!("{}", lit.var));
+                if lit.pol {
+                    var
+                } else {
+                    var.not()
+                }
+            })
+            .collect();
+
+        let terms: Vec<_> = terms.iter().collect();
+        let clause = Bool::or(&ctx, &terms);
+        solver.assert(&clause);
+    }
+
+    let inferred = infer_variables(base_clauses);
+    let base = SearchNode::new(&ctx, &solver, inferred);
     let mut stack = vec![base];
+    let mut deepest = 0;
     while let Some(node) = stack.last_mut() {
         match node.search() {
-            Some(child) => stack.push(child),
+            Some(child) => {
+                if child.assigned.len() > deepest {
+                    deepest = child.assigned.len();
+                    println!("new deepest: {deepest}");
+                    println!("non-deterministic variables: {}", child.nondet_num);
+                }
+
+                stack.push(child);
+            }
             None => {
                 stack.pop();
             }
