@@ -6,3 +6,10 @@ edition = "2021"
 [dependencies]
 im = "15.1.0"
 z3 = "0.12.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "problems"
+harness = false
