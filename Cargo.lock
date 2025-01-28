@@ -459,7 +459,7 @@ dependencies = [
 [[package]]
 name = "satisfaction"
 version = "0.1.0"
-source = "git+http://github.com/marceline-cramer/satisfaction.git?rev=8406216#8406216811c602788d9b0ccd5ac78dd2e14acbaa"
+source = "git+http://github.com/marceline-cramer/satisfaction.git?rev=549abd0#549abd059b7a3b9953b900b47b8313ab2d083326"
 dependencies = [
  "cadical",
  "im",

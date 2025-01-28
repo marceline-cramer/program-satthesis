@@ -102,24 +102,7 @@ impl VariableInference {
 
         let clauses = bodies
             .iter()
-            .map(|body| {
-                let clause = body
-                    .clause
-                    .iter()
-                    .cloned()
-                    .map(|lit| {
-                        // TODO: impl From<Literal> for BoolExpr
-                        let var = BoolExpr::Variable(lit.variable);
-                        if lit.polarity {
-                            var
-                        } else {
-                            var.not()
-                        }
-                    })
-                    .collect();
-
-                BoolExpr::And(clause)
-            })
+            .map(|body| BoolExpr::And(body.clause.iter().cloned().map(BoolExpr::from).collect()))
             .collect();
 
         BoolExpr::Or(clauses)
@@ -226,8 +209,7 @@ impl SearchNode {
             };
 
             // constrain the value of the variable
-            // TODO: impl Display for BoolExpr
-            self.log.push_str(&format!("{var} = {condition:?}\n"));
+            self.log.push_str(&format!("{var} = {condition}\n"));
             let var = BoolExpr::Variable(Variable::Base(var));
             self.scope.assert(var.iff(&condition));
         }

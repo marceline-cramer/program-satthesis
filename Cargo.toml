@@ -10,7 +10,7 @@ cadical = "0.1.15"
 
 [dependencies.satisfaction]
 git = "http://github.com/marceline-cramer/satisfaction.git"
-rev = "8406216"
+rev = "549abd0"
 features = ["cadical"]
 
 [dev-dependencies]
