@@ -5,7 +5,13 @@ edition = "2021"
 
 [dependencies]
 im = "15.1.0"
-z3 = "0.12.1"
+# TODO: only needed to access Callbacks trait. will fix in satisfaction upstream
+cadical = "0.1.15"
+
+[dependencies.satisfaction]
+git = "http://github.com/marceline-cramer/satisfaction.git"
+rev = "8406216"
+features = ["cadical"]
 
 [dev-dependencies]
 criterion = "0.5"
